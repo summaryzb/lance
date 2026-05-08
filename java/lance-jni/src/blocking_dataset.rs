@@ -2044,6 +2044,34 @@ fn inner_get_lance_file_format_version<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetSerializedManifest(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jbyteArray {
+    match inner_get_serialized_manifest(&mut env, java_dataset) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_get_serialized_manifest(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+) -> Result<jbyteArray> {
+    let manifest_bytes = {
+        let dataset_guard = unsafe {
+            env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+        }?;
+        dataset_guard.inner.manifest().serialized()
+    };
+    let byte_array = env.byte_array_from_slice(&manifest_bytes)?;
+    Ok(**byte_array)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeTake(
     mut env: JNIEnv,
     java_dataset: JObject,
