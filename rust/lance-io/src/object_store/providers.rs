@@ -22,6 +22,8 @@ use lance_core::error::{Error, LanceOptionExt, Result};
 pub mod aws;
 #[cfg(feature = "azure")]
 pub mod azure;
+#[cfg(feature = "bos")]
+pub mod bos;
 #[cfg(feature = "gcp")]
 pub mod gcp;
 #[cfg(feature = "huggingface")]
@@ -321,6 +323,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "bos")]
+        providers.insert("bos".into(), Arc::new(bos::BosStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
