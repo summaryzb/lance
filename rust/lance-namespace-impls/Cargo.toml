@@ -13,7 +13,7 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest", "dep:serde"]
+rest = ["dep:reqwest", "dep:serde", "dep:aws-credential-types", "dep:aws-sigv4", "dep:aws-smithy-runtime-api"]
 rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
@@ -39,6 +39,7 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
     "stream",
     "rustls-tls-native-roots",
 ] }
+aws-sigv4 = { workspace = true, optional = true }
 # Directory implementation dependencies (always enabled)
 url = { workspace = true }
 lance = { workspace = true }
@@ -84,6 +85,9 @@ rustls-pki-types = { version = "1", optional = true }
 # Azure credential vending dependencies (optional, enabled by "credential-vendor-azure" feature)
 hmac = { version = "0.12", optional = true }
 quick-xml = { version = "0.38", optional = true }
+
+# AWS SigV4 signing (optional, enabled by "rest" feature)
+aws-smithy-runtime-api = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

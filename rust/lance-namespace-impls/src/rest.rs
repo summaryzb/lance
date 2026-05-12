@@ -4,14 +4,23 @@
 //! REST implementation of Lance Namespace
 
 use std::collections::HashMap;
+use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::OpsMetrics;
 
 use async_trait::async_trait;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
+    SignatureLocation, SigningInstructions, SigningSettings, UriPathNormalizationMode, sign,
+};
+use aws_sigv4::sign::v4::SigningParams;
+use aws_smithy_runtime_api::client::identity::Identity;
 use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
+use std::time::SystemTime;
 
 use crate::context::{DynamicContextProvider, OperationInfo};
 
@@ -64,6 +73,7 @@ struct RestClient {
     base_path: String,
     base_headers: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    identity: Option<Credentials>,
 }
 
 impl std::fmt::Debug for RestClient {
@@ -115,6 +125,85 @@ impl RestClient {
         }
     }
 
+    fn apply_aws_sign_headers(&self, request: &mut reqwest::Request) {
+        if let Some(identity) = &self.identity {
+            let Some(cloned_request) = request.try_clone() else {
+                log::warn!("Failed to clone request for SigV4 signing (streaming body?)");
+                return;
+            };
+
+            match self.sign(cloned_request, identity) {
+                Ok(signing_instructions) => {
+                    let request_headers = request.headers_mut();
+                    for (key, value) in signing_instructions.headers() {
+                        if let (Ok(header_name), Ok(header_value)) =
+                            (HeaderName::from_str(key), HeaderValue::from_str(value))
+                        {
+                            request_headers.insert(header_name, header_value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("SigV4 signing failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn sign(
+        &self,
+        request: reqwest::Request,
+        cred: &Credentials,
+    ) -> std::result::Result<SigningInstructions, Error> {
+        let settings = {
+            let mut s = SigningSettings::default();
+            s.percent_encoding_mode = PercentEncodingMode::Single;
+            s.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+            s.signature_location = SignatureLocation::Headers;
+            s.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+            s.session_token_mode = SessionTokenMode::Exclude;
+            s
+        };
+        let identity = Identity::new(cred.clone(), None);
+        let signing_params = SigningParams::builder()
+            .identity(&identity)
+            .time(SystemTime::now())
+            .settings(settings)
+            .region("region")
+            .name("service_name")
+            .build()
+            .map_err(|e| Error::Internal {
+                message: format!("Failed to build SigV4 signing params: {e}"),
+                location: snafu::location!(),
+            })?;
+
+        let signable_request = SignableRequest::new(
+            request.method().as_str(),
+            request.url().as_str(),
+            request
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| match value.to_str() {
+                    Ok(v) => Some((name.as_str(), v)),
+                    Err(_) => None,
+                }),
+            SignableBody::Bytes(&[]),
+        )
+        .map_err(|e| Error::Internal {
+            message: format!("Failed to create signable request: {e}"),
+            location: snafu::location!(),
+        })?;
+
+        let (signing_instructions, _signature) = sign(signable_request, &signing_params.into())
+            .map_err(|e| Error::Internal {
+                message: format!("SigV4 signing failed: {e}"),
+                location: snafu::location!(),
+            })?
+            .into_parts();
+
+        Ok(signing_instructions)
+    }
+
     /// Execute a request with dynamic headers applied.
     ///
     /// This method builds the request, applies headers, and executes it.
@@ -126,6 +215,7 @@ impl RestClient {
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
         self.apply_headers(&mut request, operation, object_id);
+        self.apply_aws_sign_headers(&mut request);
         self.client.execute(request).await
     }
 
@@ -170,6 +260,7 @@ pub struct RestNamespaceBuilder {
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, tracks operation metrics. Default: false.
     ops_metrics_enabled: bool,
+    identity: Option<Credentials>,
 }
 
 impl std::fmt::Debug for RestNamespaceBuilder {
@@ -211,6 +302,7 @@ impl RestNamespaceBuilder {
             assert_hostname: true,
             context_provider: None,
             ops_metrics_enabled: false,
+            identity: None,
         }
     }
 
@@ -256,11 +348,12 @@ impl RestNamespaceBuilder {
     /// ```
     pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
         // Extract URI (required)
-        let uri = properties.get("uri").cloned().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Missing required property 'uri' for REST namespace".to_string(),
-            })
-        })?;
+        let uri =
+            Self::get_prop_or_env(&properties, "uri", "DATABUILDER_ENDPOINT").ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Missing required property 'uri' for REST namespace".to_string(),
+                })
+            })?;
 
         // Extract delimiter (optional)
         let delimiter = properties
@@ -270,13 +363,45 @@ impl RestNamespaceBuilder {
 
         // Extract headers (properties prefixed with "header." or "headers.")
         let mut headers = HashMap::new();
+        let mut has_workspace_id_header = false;
         for (key, value) in &properties {
             if let Some(header_name) = key
                 .strip_prefix("header.")
                 .or_else(|| key.strip_prefix("headers."))
             {
                 headers.insert(header_name.to_string(), value.clone());
+                if header_name.eq_ignore_ascii_case("x-lance-ctx-workspaceId") {
+                    has_workspace_id_header = true;
+                }
             }
+        }
+
+        // Extract databuilder workspaceId
+        if !has_workspace_id_header {
+            if let Some(workspace_id) = env::var("DATABUILDER_WORKSPACE_ID").ok() {
+                headers.insert("x-lance-ctx-workspaceId".to_string(), workspace_id);
+            }
+        }
+
+        // Extract databuilder credential
+        let mut identity: Option<Credentials> = None;
+        let access_key_id =
+            Self::get_prop_or_env(&properties, "access-key-id", "DATABUILDER_ACCESS_KEY_ID");
+        let secret_access_key = Self::get_prop_or_env(
+            &properties,
+            "secret-access-key",
+            "DATABUILDER_SECRET_ACCESS_KEY",
+        );
+        let session_token =
+            Self::get_prop_or_env(&properties, "session-token", "DATABUILDER_SESSION_TOKEN");
+        if let (Some(access_key_id), Some(secret_access_key)) = (access_key_id, secret_access_key) {
+            identity = Some(Credentials::new(
+                access_key_id,
+                secret_access_key,
+                session_token,
+                None,
+                "manual-credentials",
+            ));
         }
 
         // Extract TLS options
@@ -304,7 +429,19 @@ impl RestNamespaceBuilder {
             assert_hostname,
             context_provider: None,
             ops_metrics_enabled,
+            identity,
         })
+    }
+
+    fn get_prop_or_env(
+        properties: &HashMap<String, String>,
+        prop_key: &str,
+        env_key: &str,
+    ) -> Option<String> {
+        if let Some(val) = properties.get(prop_key) {
+            return Some(val.clone());
+        }
+        env::var(env_key).ok()
     }
 
     /// Set the delimiter for object identifiers.
@@ -519,6 +656,7 @@ impl RestNamespace {
             base_path: builder.uri,
             base_headers: builder.headers,
             context_provider: builder.context_provider,
+            identity: builder.identity,
         };
 
         let ops_metrics = if builder.ops_metrics_enabled {
@@ -839,7 +977,10 @@ impl LanceNamespace for RestNamespace {
         self.get_json(&path, &query, "list_tables", &id).await
     }
 
-    async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
+    async fn describe_table(
+        &self,
+        mut request: DescribeTableRequest,
+    ) -> Result<DescribeTableResponse> {
         self.record_op("describe_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
@@ -860,6 +1001,8 @@ impl LanceNamespace for RestNamespace {
             check_declared_str = check_declared.to_string();
             query.push(("check_declared", check_declared_str.as_str()));
         }
+        // Always request credential vending so the client can access the table's storage
+        request.vend_credentials = Some(true);
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
     }
