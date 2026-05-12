@@ -745,6 +745,7 @@ pub async fn commit_handler_from_url(
         "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
+        "hdfs" => Ok(Arc::new(RenameCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),

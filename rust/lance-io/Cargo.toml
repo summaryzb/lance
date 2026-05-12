@@ -16,6 +16,7 @@ rust-version.workspace = true
 object_store = { workspace = true }
 opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
+hdfs-native-object-store = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-namespace.workspace = true
@@ -79,6 +80,7 @@ oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 bos = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
+hdfs = ["dep:hdfs-native-object-store"]
 test-util = []
 
 [lints]

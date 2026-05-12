@@ -30,7 +30,15 @@ half = { version = "2.5", default-features = false, features = [
     "num-traits",
     "std",
 ] }
-lance = { path = "../rust/lance", features = [
+lance = { path = "../rust/lance", default-features = false, features = [
+    "aws",
+    "azure",
+    "gcp",
+    "oss",
+    "huggingface",
+    "tencent",
+    "bos",
+    "geo",
     "dynamodb",
     "substrait",
 ] }

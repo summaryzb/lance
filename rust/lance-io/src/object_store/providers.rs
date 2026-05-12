@@ -26,6 +26,8 @@ pub mod azure;
 pub mod bos;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "hdfs")]
+pub mod hdfs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -325,6 +327,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         #[cfg(feature = "bos")]
         providers.insert("bos".into(), Arc::new(bos::BosStoreProvider));
+        #[cfg(feature = "hdfs")]
+        providers.insert("hdfs".into(), Arc::new(hdfs::HdfsStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
