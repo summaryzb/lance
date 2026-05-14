@@ -6,8 +6,9 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow_schema::{DataType, Field};
 use jni::JNIEnv;
-use jni::objects::{JFloatArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::{jboolean, jfloat, jlong};
+use jni::objects::{JFloatArray, JMap, JObject, JString};
+use jni::signature::{Primitive, ReturnType};
+use jni::sys::{jdouble, jvalue};
 use lance::dataset::optimize::{CompactionMode, CompactionOptions};
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
@@ -23,6 +24,7 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::jni_cache::JniCache;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::Query;
@@ -493,16 +495,20 @@ pub fn to_java_map<'local>(
     env: &mut JNIEnv<'local>,
     map: &HashMap<String, String>,
 ) -> Result<JObject<'local>> {
-    let java_map = env.new_object("java/util/HashMap", "()V", &[])?;
+    let cache = JniCache::get();
+    let java_map =
+        unsafe { env.new_object_unchecked(&cache.hash_map_class, cache.hash_map_ctor, &[])? };
     for (k, v) in map {
         let jkey = env.new_string(k)?;
         let jval = env.new_string(v)?;
-        env.call_method(
-            &java_map,
-            "put",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            &[JValue::Object(&jkey), JValue::Object(&jval)],
-        )?;
+        unsafe {
+            env.call_method_unchecked(
+                &java_map,
+                cache.hash_map_put,
+                ReturnType::Object,
+                &[jvalue { l: jkey.as_raw() }, jvalue { l: jval.as_raw() }],
+            )?
+        };
     }
     Ok(java_map)
 }
@@ -511,14 +517,18 @@ pub fn to_java_list<'local>(
     env: &mut JNIEnv<'local>,
     list: &Vec<JObject>,
 ) -> Result<JObject<'local>> {
-    let java_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    let cache = JniCache::get();
+    let java_list =
+        unsafe { env.new_object_unchecked(&cache.array_list_class, cache.array_list_ctor, &[])? };
     for item in list {
-        env.call_method(
-            &java_list,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[JValue::Object(item)],
-        )?;
+        unsafe {
+            env.call_method_unchecked(
+                &java_list,
+                cache.array_list_add,
+                ReturnType::Primitive(Primitive::Boolean),
+                &[jvalue { l: item.as_raw() }],
+            )?
+        };
     }
     Ok(java_list)
 }
@@ -527,14 +537,16 @@ pub fn to_java_optional<'local>(
     env: &mut JNIEnv<'local>,
     value: JObject,
 ) -> Result<JObject<'local>> {
-    Ok(env
-        .call_static_method(
-            "java/util/Optional",
-            "ofNullable",
-            "(Ljava/lang/Object;)Ljava/util/Optional;",
-            &[JValueGen::Object(&value)],
+    let cache = JniCache::get();
+    let result = unsafe {
+        env.call_static_method_unchecked(
+            &cache.optional_class,
+            cache.optional_of_nullable,
+            ReturnType::Object,
+            &[jvalue { l: value.as_raw() }],
         )?
-        .l()?)
+    };
+    Ok(result.l()?)
 }
 
 pub fn to_java_long_obj<'local>(
@@ -542,11 +554,13 @@ pub fn to_java_long_obj<'local>(
     value: Option<i64>,
 ) -> Result<JObject<'local>> {
     match value {
-        Some(base_index) => Ok(env.new_object(
-            "java/lang/Long",
-            "(J)V",
-            &[JValue::Long(base_index as jlong)],
-        )?),
+        Some(v) => {
+            let cache = JniCache::get();
+            let obj = unsafe {
+                env.new_object_unchecked(&cache.long_class, cache.long_ctor, &[jvalue { j: v }])?
+            };
+            Ok(obj)
+        }
         None => Ok(JObject::null()),
     }
 }
@@ -556,11 +570,19 @@ pub fn to_java_boolean_obj<'local>(
     value: Option<bool>,
 ) -> Result<JObject<'local>> {
     match value {
-        Some(base_index) => Ok(env.new_object(
-            "java/lang/Boolean",
-            "(Z)V",
-            &[JValue::Bool(base_index as jboolean)],
-        )?),
+        Some(v) => {
+            let cache = JniCache::get();
+            let obj = unsafe {
+                env.new_object_unchecked(
+                    &cache.boolean_class,
+                    cache.boolean_ctor,
+                    &[jvalue {
+                        z: if v { 1 } else { 0 },
+                    }],
+                )?
+            };
+            Ok(obj)
+        }
         None => Ok(JObject::null()),
     }
 }
@@ -570,11 +592,13 @@ pub fn to_java_float_obj<'local>(
     value: Option<f32>,
 ) -> Result<JObject<'local>> {
     match value {
-        Some(base_index) => Ok(env.new_object(
-            "java/lang/Float",
-            "(F)V",
-            &[JValue::Float(base_index as jfloat)],
-        )?),
+        Some(v) => {
+            let cache = JniCache::get();
+            let obj = unsafe {
+                env.new_object_unchecked(&cache.float_class, cache.float_ctor, &[jvalue { f: v }])?
+            };
+            Ok(obj)
+        }
         None => Ok(JObject::null()),
     }
 }
@@ -584,7 +608,17 @@ pub fn to_java_double_obj<'local>(
     value: Option<f64>,
 ) -> Result<JObject<'local>> {
     match value {
-        Some(v) => Ok(env.new_object("java/lang/Double", "(D)V", &[JValue::Double(v)])?),
+        Some(v) => {
+            let cache = JniCache::get();
+            let obj = unsafe {
+                env.new_object_unchecked(
+                    &cache.double_class,
+                    cache.double_ctor,
+                    &[jvalue { d: v as jdouble }],
+                )?
+            };
+            Ok(obj)
+        }
         None => Ok(JObject::null()),
     }
 }

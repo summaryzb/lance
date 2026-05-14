@@ -51,6 +51,7 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod index;
+mod jni_cache;
 mod merge_insert;
 mod namespace;
 mod optimize;
@@ -169,6 +170,16 @@ pub extern "system" fn JNI_OnLoad(
     let mut env = vm
         .get_env()
         .expect("Failed to get JNIEnv in JNI_OnLoad");
+
+    // Boxed-type / collection class+method ID cache — must be resolved on the
+    // JNI_OnLoad thread to capture the application classloader.
+    let jni_cache = jni_cache::JniCache::init(&mut env)
+        .expect("Failed to initialize JniCache in JNI_OnLoad");
+    jni_cache::JNI_CACHE
+        .set(jni_cache)
+        .ok()
+        .expect("JniCache already initialized");
+
     let async_scanner_local = env
         .find_class("org/lance/ipc/AsyncScanner")
         .expect("AsyncScanner class not found");

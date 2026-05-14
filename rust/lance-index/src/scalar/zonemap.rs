@@ -810,7 +810,13 @@ pub async fn write_zonemap_index_from_batch(
 pub fn validate_zonemap_stats_schema(schema: &arrow_schema::Schema) -> Result<()> {
     let fields = schema.fields();
     const EXPECTED_NAMES: [&str; 7] = [
-        "min", "max", "null_count", "nan_count", "fragment_id", "zone_start", "zone_length",
+        "min",
+        "max",
+        "null_count",
+        "nan_count",
+        "fragment_id",
+        "zone_start",
+        "zone_length",
     ];
     if fields.len() != EXPECTED_NAMES.len() {
         return Err(Error::invalid_input(format!(
@@ -2656,9 +2662,16 @@ mod tests {
 
     /// Build a schema with the canonical column ordering, then mutate via `mutate` and return.
     /// Used by the validate_zonemap_stats_schema rejection-branch tests below.
-    fn canonical_with(value_type: DataType, mutate: impl FnOnce(Vec<Field>) -> Vec<Field>) -> Schema {
+    fn canonical_with(
+        value_type: DataType,
+        mutate: impl FnOnce(Vec<Field>) -> Vec<Field>,
+    ) -> Schema {
         let canonical = super::zonemap_stats_schema(&value_type);
-        let fields = canonical.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let fields = canonical
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         Schema::new(mutate(fields))
     }
 

@@ -311,9 +311,7 @@ pub async fn write_consolidated_zonemap_segment(
     use arrow_array::cast::AsArray;
     use arrow_array::types::UInt64Type;
     use lance_index::scalar::IndexStore;
-    use lance_index::scalar::zonemap::{
-        ZONEMAP_INDEX_VERSION, write_zonemap_index_from_batch,
-    };
+    use lance_index::scalar::zonemap::{ZONEMAP_INDEX_VERSION, write_zonemap_index_from_batch};
     use roaring::RoaringBitmap;
     use uuid::Uuid;
 
@@ -357,11 +355,9 @@ pub async fn write_consolidated_zonemap_segment(
     let index_details = prost_types::Any::from_msg(
         &lance_index::pbold::ZoneMapIndexDetails::default(),
     )
-    .map_err(|e| {
-        Error::Internal {
-            message: format!("failed to encode ZoneMapIndexDetails: {}", e),
-            location: snafu::location!(),
-        }
+    .map_err(|e| Error::Internal {
+        message: format!("failed to encode ZoneMapIndexDetails: {}", e),
+        location: snafu::location!(),
     })?;
 
     Ok(IndexMetadata {
@@ -974,22 +970,14 @@ mod tests {
         let params = ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE);
 
         // 1. Compute per-fragment-subset batches.
-        let batch_0_1 = compute_zonemap_batch(
-            &dataset,
-            "values",
-            Some(vec![0u32, 1]),
-            params.clone(),
-        )
-        .await
-        .unwrap();
-        let batch_2_3 = compute_zonemap_batch(
-            &dataset,
-            "values",
-            Some(vec![2u32, 3]),
-            params.clone(),
-        )
-        .await
-        .unwrap();
+        let batch_0_1 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![0u32, 1]), params.clone())
+                .await
+                .unwrap();
+        let batch_2_3 =
+            compute_zonemap_batch(&dataset, "values", Some(vec![2u32, 3]), params.clone())
+                .await
+                .unwrap();
 
         // Each batch must validate against the canonical schema.
         validate_zonemap_stats_schema(batch_0_1.schema().as_ref()).unwrap();
@@ -1114,9 +1102,9 @@ mod tests {
             .files
             .expect("files must be populated for a freshly written segment");
         assert!(
-            files
-                .iter()
-                .any(|f| f.path.ends_with(lance_index::scalar::zonemap::ZONEMAP_FILENAME)),
+            files.iter().any(|f| f
+                .path
+                .ends_with(lance_index::scalar::zonemap::ZONEMAP_FILENAME)),
             "freshly written segment must contain {}; got {:?}",
             lance_index::scalar::zonemap::ZONEMAP_FILENAME,
             files.iter().map(|f| &f.path).collect::<Vec<_>>()
