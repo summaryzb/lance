@@ -935,6 +935,24 @@ public class Dataset implements Closeable {
 
   private native Map<String, String> nativeGetLatestStorageOptions();
 
+  /**
+   * Get the serialized manifest of this dataset.
+   *
+   * <p>Returns the manifest as a byte array that can be passed to {@link
+   * ReadOptions.Builder#setSerializedManifest(java.nio.ByteBuffer)} to open a dataset without
+   * re-reading the manifest from storage.
+   *
+   * @return the serialized manifest bytes
+   */
+  public byte[] getSerializedManifest() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetSerializedManifest();
+    }
+  }
+
+  private native byte[] nativeGetSerializedManifest();
+
   /** Checkout the dataset to the latest version. */
   public void checkoutLatest() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
