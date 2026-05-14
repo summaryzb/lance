@@ -28,6 +28,8 @@ pub mod gcp;
 pub mod huggingface;
 pub mod local;
 pub mod memory;
+#[cfg(feature = "bos")]
+pub mod bos;
 #[cfg(feature = "oss")]
 pub mod oss;
 #[cfg(feature = "tencent")]
@@ -321,6 +323,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
+        #[cfg(feature = "bos")]
+        providers.insert("bos".into(), Arc::new(bos::BosStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
