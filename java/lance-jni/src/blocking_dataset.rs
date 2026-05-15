@@ -3429,11 +3429,6 @@ fn inner_get_zonemap_stats_ipc<'local>(
     java_dataset: JObject,
     jcolumn_name: JString,
 ) -> Result<JObject<'local>> {
-    use lance::dataset::index::LanceIndexStoreExt;
-    use lance::index::DatasetIndexExt;
-    use lance_index::scalar::IndexStore;
-    use lance_index::scalar::lance_format::LanceIndexStore;
-
     let column_name: String = jcolumn_name.extract(env)?;
 
     // 1. Same dataset+segment-discovery path as before — unchanged.
@@ -3453,71 +3448,9 @@ fn inner_get_zonemap_stats_ipc<'local>(
         })?;
 
         RT.block_on(async {
-            let descriptions = dataset
-                .describe_indices(Some(lance_index::IndexCriteria {
-                    for_column: Some(&column_name),
-                    has_name: None,
-                    must_support_fts: false,
-                    must_support_exact_equality: false,
-                }))
+            lance::index::scalar::read_zonemap_stats_cached(&dataset, &column_name)
                 .await
-                .map_err(Error::from)?;
-
-            let zonemap_desc = descriptions
-                .iter()
-                .find(|desc| desc.index_type().to_lowercase().contains("zonemap"));
-
-            match zonemap_desc {
-                Some(desc) => {
-                    let mut indices = dataset
-                        .load_indices_by_name(desc.name())
-                        .await
-                        .map_err(Error::from)?;
-                    indices.sort_by_key(|idx| {
-                        idx.fragment_bitmap
-                            .as_ref()
-                            .and_then(|bitmap| bitmap.iter().next())
-                            .unwrap_or_default()
-                    });
-
-                    use futures::stream::{self, StreamExt, TryStreamExt};
-                    use lance_index::scalar::zonemap::ZONEMAP_FILENAME;
-                    let max_concurrent_segment_reads = dataset
-                        .object_store(None)
-                        .await
-                        .map_err(Error::from)?
-                        .io_parallelism();
-                    let dataset_ref = &dataset;
-                    let batches: Vec<arrow_array::RecordBatch> = stream::iter(indices.iter())
-                        .map(|index| async move {
-                            let index_store = Arc::new(
-                                LanceIndexStore::from_dataset_for_existing(dataset_ref, index)
-                                    .await
-                                    .map_err(Error::from)?,
-                            );
-                            let index_file = index_store
-                                .open_index_file(ZONEMAP_FILENAME)
-                                .await
-                                .map_err(Error::from)?;
-                            if index_file.num_rows() == 0 {
-                                Ok::<Option<arrow_array::RecordBatch>, Error>(None)
-                            } else {
-                                Ok(Some(
-                                    index_file
-                                        .read_range(0..index_file.num_rows(), None)
-                                        .await
-                                        .map_err(Error::from)?,
-                                ))
-                            }
-                        })
-                        .buffered(max_concurrent_segment_reads)
-                        .try_filter_map(|opt| std::future::ready(Ok(opt)))
-                        .try_collect()
-                        .await?;
-                    Ok::<_, Error>(batches)
-                }
-                None => Ok(Vec::new()),
-            }
+                .map_err(Error::from)
         })?
     };
 

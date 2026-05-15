@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
-use crate::session::index_caches::ProstAny;
+use crate::session::index_caches::{ProstAny, ZoneMapStatsBatches, ZoneMapStatsKey};
 use crate::{
     Dataset,
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
@@ -352,13 +352,9 @@ pub async fn write_consolidated_zonemap_segment(
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid.to_string())?;
     write_zonemap_index_from_batch(batch, params, &index_store).await?;
 
-    let index_details = prost_types::Any::from_msg(
-        &lance_index::pbold::ZoneMapIndexDetails::default(),
-    )
-    .map_err(|e| Error::Internal {
-        message: format!("failed to encode ZoneMapIndexDetails: {}", e),
-        location: snafu::location!(),
-    })?;
+    let index_details =
+        prost_types::Any::from_msg(&lance_index::pbold::ZoneMapIndexDetails::default())
+            .map_err(|e| Error::internal(format!("failed to encode ZoneMapIndexDetails: {}", e)))?;
 
     Ok(IndexMetadata {
         uuid,
@@ -372,6 +368,126 @@ pub async fn write_consolidated_zonemap_segment(
         base_id: None,
         files: Some(index_store.list_files_with_sizes().await?),
     })
+}
+
+/// Reads all zonemap segments for `column`, with `index_cache` reuse per segment.
+///
+/// Each segment is keyed by its `IndexMetadata.uuid` and stored as a
+/// `Vec<RecordBatch>` (one batch in current schema, but we keep the Vec shape
+/// future-proofed). Cold reads stream segments concurrently bounded by the
+/// object store's `io_parallelism`; warm reads return cloned batches from the
+/// `Arc`-wrapped cache entry.
+///
+/// Returns segments in fragment-id order (lowest first). Empty Vec if `column`
+/// has no zonemap index. Caller (currently `lance-jni`) is responsible for IPC
+/// encoding.
+///
+/// **Visibility:** `pub` (not `pub(crate)`) because the only call-site today is
+/// the `lance-jni` crate at `java/lance-jni/src/blocking_dataset.rs`, which is a
+/// separate crate (workspace dependency on `lance`).
+pub async fn read_zonemap_stats_cached(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use lance_index::scalar::zonemap::ZONEMAP_FILENAME;
+
+    // 1. describe_indices is already metadata-cache-backed; cheap on warm paths.
+    let descriptions = dataset
+        .describe_indices(Some(IndexCriteria {
+            for_column: Some(column),
+            has_name: None,
+            must_support_fts: false,
+            must_support_exact_equality: false,
+        }))
+        .await?;
+
+    let Some(zonemap_desc) = descriptions
+        .iter()
+        .find(|desc| desc.index_type().to_lowercase().contains("zonemap"))
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut indices = dataset.load_indices_by_name(zonemap_desc.name()).await?;
+    // Sort by (min fragment id, uuid). Using `Option<u32>` directly avoids the
+    // prior `unwrap_or_default()` collapse that aliased a missing/empty
+    // fragment_bitmap with real fragment 0 and produced non-deterministic
+    // ordering under unstable sort. The uuid tiebreaker keeps order stable
+    // when two indices share the same min fragment id (or both have None).
+    indices.sort_by_key(|idx| {
+        (
+            idx.fragment_bitmap
+                .as_ref()
+                .and_then(|bitmap| bitmap.iter().next()),
+            idx.uuid,
+        )
+    });
+
+    let max_concurrent = dataset.object_store(None).await?.io_parallelism();
+    let dataset_ref = dataset;
+
+    // 2. Per-segment cache lookup. Each segment is independent; we accept the
+    //    rare double-load race when multiple concurrent callers all miss the
+    //    same key (cf. `bitmap.rs:256-290` which uses the same manual
+    //    get-then-insert pattern). Result: at most one duplicate IO per cold
+    //    key, no correctness issue.
+    let segment_batches: Vec<arrow_array::RecordBatch> = stream::iter(indices.iter())
+        .map(|index| async move {
+            let uuid_str = index.uuid.to_string();
+            let cache_key = ZoneMapStatsKey { uuid: &uuid_str };
+
+            if let Some(cached) = dataset_ref.index_cache.get_with_key(&cache_key).await {
+                tracing::trace!(
+                    target: "lance::index::scalar",
+                    uuid = %uuid_str,
+                    column = %column,
+                    "zonemap_segment_cache_hit"
+                );
+                // Warm path: clone the Vec<RecordBatch>. RecordBatch::clone is
+                // shallow (Arc-bumps Arrow buffers), so this is cheap.
+                return Ok::<_, Error>(cached.0.clone());
+            }
+
+            // Cold path: open + read.
+            let index_store =
+                Arc::new(LanceIndexStore::from_dataset_for_existing(dataset_ref, index).await?);
+            let index_file = index_store.open_index_file(ZONEMAP_FILENAME).await?;
+            let batches: Vec<arrow_array::RecordBatch> = if index_file.num_rows() == 0 {
+                Vec::new()
+            } else {
+                vec![
+                    index_file
+                        .read_range(0..index_file.num_rows(), None)
+                        .await?,
+                ]
+            };
+
+            tracing::trace!(
+                target: "lance::index::scalar",
+                uuid = %uuid_str,
+                column = %column,
+                rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                "zonemap_segment_loaded"
+            );
+
+            // Insert into cache regardless of empty/non-empty so that empty
+            // segments don't get re-read either. CRITICAL: API requires
+            // `Arc<K::ValueType>` (see `rust/lance-core/src/cache/mod.rs:308`),
+            // so wrap with Arc::new before insert.
+            let entry = ZoneMapStatsBatches(batches.clone());
+            dataset_ref
+                .index_cache
+                .insert_with_key(&cache_key, Arc::new(entry))
+                .await;
+
+            Ok(batches)
+        })
+        .buffered(max_concurrent)
+        .try_concat()
+        .await?;
+
+    Ok(segment_batches)
 }
 
 // TODO: Allow users to register their own plugins
@@ -2209,6 +2325,179 @@ mod tests {
         assert_eq!(
             count_banana_rows, 0,
             "Should have 0 rows with value='banana' after deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_zonemap_stats_cached_returns_same_batches_as_uncached() {
+        use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::read_zonemap_stats_cached;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+
+        // Match the inline-fixture pattern used in test_initialize_scalar_index_zonemap
+        // (`scalar.rs:1599-1640`) so reviewers can cross-reference the same APIs.
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/cached_eq", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(400), BatchCount::from(4));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let zonemap_params = ZoneMapIndexBuilderParams::new(50);
+        let params_json = serde_json::to_value(&zonemap_params).unwrap();
+        let index_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+                .with_params(&params_json);
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::ZoneMap,
+                Some("values_zm".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&uri).await.unwrap();
+
+        let cached = read_zonemap_stats_cached(&dataset, "values").await.unwrap();
+        assert!(!cached.is_empty(), "expected non-empty zonemap stats");
+        for b in &cached {
+            assert!(b.num_rows() > 0, "no zone batch should be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_zonemap_stats_cached_warm_hit_increments_cache_count() {
+        use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::read_zonemap_stats_cached;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/warm_hit", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(400), BatchCount::from(4));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let zonemap_params = ZoneMapIndexBuilderParams::new(50);
+        let index_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+                .with_params(&serde_json::to_value(&zonemap_params).unwrap());
+        dataset
+            .create_index(
+                &["values"],
+                IndexType::ZoneMap,
+                Some("zm".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        let dataset = Dataset::open(&uri).await.unwrap();
+
+        let count_before = dataset.index_cache_entry_count().await;
+        let cold = read_zonemap_stats_cached(&dataset, "values").await.unwrap();
+        let count_after_cold = dataset.index_cache_entry_count().await;
+        let warm = read_zonemap_stats_cached(&dataset, "values").await.unwrap();
+        let count_after_warm = dataset.index_cache_entry_count().await;
+
+        // Cold path adds exactly one entry per zonemap segment (strong assertion,
+        // replaces the weak hit_rate>0 check which was sensitive to unrelated
+        // cache traffic during dataset open).
+        let segment_count = dataset.load_indices_by_name("zm").await.unwrap().len();
+        assert_eq!(
+            count_after_cold - count_before,
+            segment_count,
+            "cold path must add exactly one cache entry per segment"
+        );
+        assert_eq!(
+            count_after_cold, count_after_warm,
+            "warm path must allocate zero new cache entries"
+        );
+        // Returned data must be byte-equivalent between cold and warm.
+        assert_eq!(cold.len(), warm.len());
+        for (c, w) in cold.iter().zip(warm.iter()) {
+            assert_eq!(c.num_rows(), w.num_rows());
+            assert_eq!(c.schema(), w.schema());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_zonemap_stats_cached_isolates_columns_and_bounded_growth() {
+        use crate::dataset::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::read_zonemap_stats_cached;
+        use arrow_array::types::Float32Type;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/two_cols", test_dir.as_str());
+        let reader = lance_datagen::gen_batch()
+            .col("col_a", array::step::<Int32Type>())
+            .col("col_b", array::rand::<Float32Type>())
+            .into_reader_rows(RowCount::from(400), BatchCount::from(4));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let zonemap_params = ZoneMapIndexBuilderParams::new(50);
+        let params_json = serde_json::to_value(&zonemap_params).unwrap();
+        let index_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+                .with_params(&params_json);
+        for col in ["col_a", "col_b"] {
+            dataset
+                .create_index(
+                    &[col],
+                    IndexType::ZoneMap,
+                    Some(format!("{}_zm", col)),
+                    &index_params,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let dataset = Dataset::open(&uri).await.unwrap();
+
+        // Column-isolation check.
+        let col_a = read_zonemap_stats_cached(&dataset, "col_a").await.unwrap();
+        let col_b = read_zonemap_stats_cached(&dataset, "col_b").await.unwrap();
+        assert!(!col_a.is_empty() && !col_b.is_empty());
+        let val_type_a = col_a[0]
+            .schema()
+            .field_with_name("min")
+            .unwrap()
+            .data_type()
+            .clone();
+        let val_type_b = col_b[0]
+            .schema()
+            .field_with_name("min")
+            .unwrap()
+            .data_type()
+            .clone();
+        assert_ne!(
+            val_type_a, val_type_b,
+            "columns must not share cache entries"
+        );
+
+        // Bounded-growth check: repeat reads cycle warm-hits but cannot grow
+        // entry_count past 2x the per-column segment count (a + b). Covers R2.
+        let count_baseline = dataset.index_cache_entry_count().await;
+        for _ in 0..5 {
+            let _ = read_zonemap_stats_cached(&dataset, "col_a").await.unwrap();
+            let _ = read_zonemap_stats_cached(&dataset, "col_b").await.unwrap();
+        }
+        let count_after_loops = dataset.index_cache_entry_count().await;
+        assert_eq!(
+            count_after_loops, count_baseline,
+            "repeated warm hits must not add entries (no unbounded growth)"
         );
     }
 }

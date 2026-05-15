@@ -9,9 +9,16 @@
 //!     ├─► DSIndexCache (prefixed by dataset URI)
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
+//!
+//! Cached value types include scalar/vector index instances, IVF partitions,
+//! posting lists, bitmaps, and zonemap segment batches. Zonemap segments are
+//! keyed by their per-segment IndexMetadata UUID, which is regenerated on
+//! every write — so consolidation/compaction naturally produces fresh keys
+//! and old entries age out via LRU.
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
+use arrow_array::RecordBatch;
 use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_index::frag_reuse::FragReuseIndex;
@@ -143,5 +150,73 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn type_name() -> &'static str {
         "ScalarIndexDetails"
+    }
+}
+
+/// Newtype for cached zonemap segment batches.
+///
+/// Stored under one IndexMetadata UUID per segment. The cache returns this
+/// wrapped in `Arc` (the `LanceCache` API does the wrap, see
+/// `rust/lance-core/src/cache/mod.rs:308-326`), so we deliberately do **not**
+/// add an inner `Arc<...>`: that would only buy us a second allocation with
+/// no extra sharing capability.
+pub struct ZoneMapStatsBatches(pub Vec<RecordBatch>);
+
+impl DeepSizeOf for ZoneMapStatsBatches {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        // RecordBatch buffers are Arc-shared. `get_array_memory_size` returns
+        // the (possibly over-counted) full backing-buffer size, which is the
+        // safer direction for an LRU byte budget — over-eviction is a soft
+        // failure, under-eviction can OOM. Sum across all batches in this
+        // segment.
+        self.0.iter().map(|b| b.get_array_memory_size()).sum()
+    }
+}
+
+/// Cache key for one zonemap index segment, identified by its IndexMetadata UUID.
+///
+/// Scoped under `DSIndexCache` (dataset URI prefix), so the same UUID across
+/// different datasets does not collide.
+#[derive(Debug)]
+pub struct ZoneMapStatsKey<'a> {
+    pub uuid: &'a str,
+}
+
+impl CacheKey for ZoneMapStatsKey<'_> {
+    type ValueType = ZoneMapStatsBatches;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("zonemap_stats/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "ZoneMapStatsBatches"
+    }
+}
+
+#[cfg(test)]
+mod zonemap_key_tests {
+    use super::*;
+    use lance_core::cache::CacheKey;
+
+    #[test]
+    fn zonemap_stats_key_contains_uuid_and_namespace() {
+        let key = ZoneMapStatsKey { uuid: "abcd-1234" };
+        let s = key.key().into_owned();
+        assert!(s.starts_with("zonemap_stats/"), "got: {}", s);
+        assert!(s.contains("abcd-1234"), "got: {}", s);
+    }
+
+    #[test]
+    fn zonemap_stats_key_distinguishes_different_uuids() {
+        let a = ZoneMapStatsKey { uuid: "u1" }.key().into_owned();
+        let b = ZoneMapStatsKey { uuid: "u2" }.key().into_owned();
+        assert_ne!(a, b);
+    }
+
+    #[allow(dead_code)]
+    fn _assert_zonemap_stats_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ZoneMapStatsBatches>();
     }
 }
