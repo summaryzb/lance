@@ -25,6 +25,7 @@ lance = { path = "../../rust/lance", default-features = false, features = [
     "tencent",
     "bos",
     "geo",
+    "hdfs",
     "substrait",
 ] }
 lance-datafusion = { path = "../../rust/lance-datafusion" }

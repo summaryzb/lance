@@ -7,7 +7,7 @@
     <groupId>org.lance</groupId>
     <artifactId>lance-core</artifactId>
     <name>Lance Core</name>
-    <version>6.0.0-rc.3</version>
+    <version>6.0.0.1-baidu-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <description>Lance Format Java API</description>
@@ -512,6 +512,80 @@
                     </plugin>
                 </plugins>
             </build>
+        </profile>
+        <profile>
+            <id>run-on-macos</id>
+            <activation>
+                <os>
+                    <family>mac</family>
+                </os>
+            </activation>
+
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-assembly-plugin</artifactId>
+                        <version>3.6.0</version>
+                        <executions>
+                            <execution>
+                                <id>make-assembly</id>
+                                <phase>package</phase>
+                                <goals>
+                                    <goal>single</goal>
+                                </goals>
+                                <configuration>
+                                    <descriptorRefs>
+                                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                                    </descriptorRefs>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>deploy-to-baidu</id>
+            <distributionManagement>
+                <repository>
+                    <id>Baidu_Local</id>
+                    <name>Baidu Local Repository</name>
+                    <url>https://maven.baidu-int.com/nexus/content/repositories/Baidu_Local</url>
+                </repository>
+                <snapshotRepository>
+                    <id>Baidu_Local_Snapshots</id>
+                    <name>Baidu Local Snapshots Repository</name>
+                    <url>https://maven.baidu-int.com/nexus/content/repositories/Baidu_Local_Snapshots</url>
+                </snapshotRepository>
+            </distributionManagement>
+            <repositories>
+                <repository>
+                    <id>baidu-nexus</id>
+                    <name>Baidu Nexus Public</name>
+                    <url>http://maven.baidu-int.com/nexus/content/groups/public/</url>
+                    <releases>
+                        <enabled>true</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                        <updatePolicy>always</updatePolicy>
+                    </snapshots>
+                </repository>
+            </repositories>
+            <pluginRepositories>
+                <pluginRepository>
+                    <id>baidu-nexus</id>
+                    <name>Baidu Nexus Public</name>
+                    <url>http://maven.baidu-int.com/nexus/content/groups/public/</url>
+                    <releases>
+                        <enabled>true</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                    </snapshots>
+                </pluginRepository>
+            </pluginRepositories>
         </profile>
     </profiles>
 </project>
