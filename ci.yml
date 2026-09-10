@@ -1,0 +1,65 @@
+Global:
+  version: 2.0
+
+Default:
+  profile: [ compile_java ]
+
+Profiles:
+  - profile:
+    name: compile_java
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: MEDIUM  # 构建双架构 native lib + LTO 链接需要较多内存
+      tools:
+        - jdk: 17.0.6
+        - maven: 3.8.6
+    build:
+      command: ./build-java.sh
+      cache:
+        enable: true
+        trimeThresholdSize: 3
+        paths:
+          - packages
+          - cache
+    artifacts:
+      release: true
+
+  - profile:
+    name: compile_python
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: MEDIUM
+      tools:
+        - python: 3.10.10
+    build:
+      command: ./build-python.sh
+      cache:
+        enable: true
+        trimeThresholdSize: 3
+        paths:
+          - packages
+          - cache
+    artifacts:
+      release: true
+
+  - profile:
+    name: deploy_java
+    mode: AGENT
+    environment:
+      image: DECK_STD_CENTOS7
+      resourceType: MEDIUM
+      tools:
+        - jdk: 17.0.6
+        - maven: 3.8.6
+    build:
+      command: ./publish-java.sh
+      cache:
+        enable: true
+        trimeThresholdSize: 3
+        paths:
+          - packages
+          - cache
+    artifacts:
+      release: false

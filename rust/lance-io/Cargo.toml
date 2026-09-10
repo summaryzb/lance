@@ -48,6 +48,7 @@ url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+regex = { version = "1.12.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
@@ -75,6 +76,7 @@ aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:op
 azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
+bos = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal", "dep:regex"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 test-util = []
 

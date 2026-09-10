@@ -4,14 +4,23 @@
 //! REST implementation of Lance Namespace
 
 use std::collections::HashMap;
+use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::OpsMetrics;
 
 use async_trait::async_trait;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
+    SignatureLocation, SigningInstructions, SigningSettings, UriPathNormalizationMode, sign,
+};
+use aws_sigv4::sign::v4::SigningParams;
+use aws_smithy_runtime_api::client::identity::Identity;
 use bytes::Bytes;
 use reqwest::header::{HeaderName, HeaderValue};
+use std::time::SystemTime;
 
 use crate::context::{DynamicContextProvider, OperationInfo};
 
@@ -66,6 +75,7 @@ struct RestClient {
     base_path: String,
     base_headers: HashMap<String, String>,
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    identity: Option<Credentials>,
 }
 
 impl std::fmt::Debug for RestClient {
@@ -117,6 +127,76 @@ impl RestClient {
         }
     }
 
+    fn apply_aws_sign_headers(&self, request: &mut reqwest::Request) {
+        if let Some(identity) = &self.identity {
+            let Some(cloned_request) = request.try_clone() else {
+                log::warn!("Failed to clone request for SigV4 signing (streaming body?)");
+                return;
+            };
+
+            match self.sign(cloned_request, identity) {
+                Ok(signing_instructions) => {
+                    let request_headers = request.headers_mut();
+                    for (key, value) in signing_instructions.headers() {
+                        if let (Ok(header_name), Ok(header_value)) =
+                            (HeaderName::from_str(key), HeaderValue::from_str(value))
+                        {
+                            request_headers.insert(header_name, header_value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("SigV4 signing failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn sign(
+        &self,
+        request: reqwest::Request,
+        cred: &Credentials,
+    ) -> std::result::Result<SigningInstructions, Error> {
+        // `SigningSettings` is `#[non_exhaustive]`, so the default has to be mutated
+        // rather than built with a struct expression.
+        #[allow(clippy::field_reassign_with_default)]
+        let settings = {
+            let mut settings = SigningSettings::default();
+            settings.percent_encoding_mode = PercentEncodingMode::Single;
+            settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+            settings.signature_location = SignatureLocation::Headers;
+            settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+            settings.session_token_mode = SessionTokenMode::Exclude;
+            settings
+        };
+        let identity = Identity::new(cred.clone(), None);
+        let signing_params = SigningParams::builder()
+            .identity(&identity)
+            .time(SystemTime::now())
+            .settings(settings)
+            .region("region")
+            .name("service_name")
+            .build()
+            .map_err(|e| Error::internal(format!("Failed to build SigV4 signing params: {e}")))?;
+
+        let signable_request = SignableRequest::new(
+            request.method().as_str(),
+            request.url().as_str(),
+            request
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str(), v))),
+            SignableBody::Bytes(&[]),
+        )
+        .map_err(|e| Error::internal(format!("Failed to create signable request: {e}")))?;
+
+        let (signing_instructions, _signature) = sign(signable_request, &signing_params.into())
+            .map_err(|e| Error::internal(format!("SigV4 signing failed: {e}")))?
+            .into_parts();
+
+        Ok(signing_instructions)
+    }
+
     /// Execute a request with dynamic headers applied.
     ///
     /// This method builds the request, applies headers, and executes it.
@@ -128,6 +208,7 @@ impl RestClient {
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
         self.apply_headers(&mut request, operation, object_id);
+        self.apply_aws_sign_headers(&mut request);
         self.client.execute(request).await
     }
 
@@ -172,6 +253,7 @@ pub struct RestNamespaceBuilder {
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, tracks operation metrics. Default: false.
     ops_metrics_enabled: bool,
+    identity: Option<Credentials>,
 }
 
 impl std::fmt::Debug for RestNamespaceBuilder {
@@ -213,6 +295,7 @@ impl RestNamespaceBuilder {
             assert_hostname: true,
             context_provider: None,
             ops_metrics_enabled: false,
+            identity: None,
         }
     }
 
@@ -258,11 +341,12 @@ impl RestNamespaceBuilder {
     /// ```
     pub fn from_properties(properties: HashMap<String, String>) -> Result<Self> {
         // Extract URI (required)
-        let uri = properties.get("uri").cloned().ok_or_else(|| {
-            lance_core::Error::from(NamespaceError::InvalidInput {
-                message: "Missing required property 'uri' for REST namespace".to_string(),
-            })
-        })?;
+        let uri =
+            Self::get_prop_or_env(&properties, "uri", "DATABUILDER_ENDPOINT").ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: "Missing required property 'uri' for REST namespace".to_string(),
+                })
+            })?;
 
         // Extract delimiter (optional)
         let delimiter = properties
@@ -272,14 +356,26 @@ impl RestNamespaceBuilder {
 
         // Extract headers (properties prefixed with "header." or "headers.")
         let mut headers = HashMap::new();
+        let mut has_workspace_id_header = false;
         for (key, value) in &properties {
             if let Some(header_name) = key
                 .strip_prefix("header.")
                 .or_else(|| key.strip_prefix("headers."))
             {
                 headers.insert(header_name.to_string(), value.clone());
+                if header_name.eq_ignore_ascii_case("x-lance-ctx-workspaceId") {
+                    has_workspace_id_header = true;
+                }
             }
         }
+
+        // Extract databuilder workspaceId
+        if !has_workspace_id_header && let Ok(workspace_id) = env::var("DATABUILDER_WORKSPACE_ID") {
+            headers.insert("x-lance-ctx-workspaceId".to_string(), workspace_id);
+        }
+
+        // Extract databuilder credential
+        let identity = Self::resolve_credentials(&properties, |key| env::var(key).ok());
 
         // Extract TLS options
         let cert_file = properties.get("tls.cert_file").cloned();
@@ -306,7 +402,79 @@ impl RestNamespaceBuilder {
             assert_hostname,
             context_provider: None,
             ops_metrics_enabled,
+            identity,
         })
+    }
+
+    fn get_prop_or_env(
+        properties: &HashMap<String, String>,
+        prop_key: &str,
+        env_key: &str,
+    ) -> Option<String> {
+        if let Some(val) = properties.get(prop_key) {
+            return Some(val.clone());
+        }
+        env::var(env_key).ok()
+    }
+
+    /// Resolve SigV4 credentials, taking all fields from a single source.
+    ///
+    /// Properties win over environment variables, but the choice is made once for
+    /// the whole credential: pairing an access key from one source with a session
+    /// token from another produces a request whose `Authorization` header and
+    /// `x-amz-security-token` header describe two different identities, which the
+    /// server can neither verify nor authorize consistently.
+    ///
+    /// The session token is optional in either source - long-term credentials have
+    /// none - so its absence never falls back to the other source. Any credential
+    /// property switches the whole credential to properties, so a lone
+    /// `session-token` is reported as incomplete instead of borrowing keys from the
+    /// environment. Blank values are treated as absent to avoid emitting an empty
+    /// `x-amz-security-token` header.
+    fn resolve_credentials(
+        properties: &HashMap<String, String>,
+        env_lookup: impl Fn(&str) -> Option<String>,
+    ) -> Option<Credentials> {
+        fn non_blank(value: Option<String>) -> Option<String> {
+            value.filter(|v| !v.trim().is_empty())
+        }
+
+        let from_properties = ["access-key-id", "secret-access-key", "session-token"]
+            .iter()
+            .any(|key| non_blank(properties.get(*key).cloned()).is_some());
+
+        let (access_key_id, secret_access_key, session_token) = if from_properties {
+            (
+                non_blank(properties.get("access-key-id").cloned()),
+                non_blank(properties.get("secret-access-key").cloned()),
+                non_blank(properties.get("session-token").cloned()),
+            )
+        } else {
+            (
+                non_blank(env_lookup("DATABUILDER_ACCESS_KEY_ID")),
+                non_blank(env_lookup("DATABUILDER_SECRET_ACCESS_KEY")),
+                non_blank(env_lookup("DATABUILDER_SESSION_TOKEN")),
+            )
+        };
+
+        match (access_key_id, secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(Credentials::new(
+                access_key_id,
+                secret_access_key,
+                session_token,
+                None,
+                "manual-credentials",
+            )),
+            _ => {
+                if from_properties {
+                    log::warn!(
+                        "Incomplete SigV4 credential in properties: both 'access-key-id' and \
+                         'secret-access-key' are required; requests will not be signed"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Set the delimiter for object identifiers.
@@ -521,6 +689,7 @@ impl RestNamespace {
             base_path: builder.uri,
             base_headers: builder.headers,
             context_provider: builder.context_provider,
+            identity: builder.identity,
         };
 
         let ops_metrics = if builder.ops_metrics_enabled {
@@ -841,7 +1010,10 @@ impl LanceNamespace for RestNamespace {
         self.get_json(&path, &query, "list_tables", &id).await
     }
 
-    async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
+    async fn describe_table(
+        &self,
+        mut request: DescribeTableRequest,
+    ) -> Result<DescribeTableResponse> {
         self.record_op("describe_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
@@ -862,6 +1034,8 @@ impl LanceNamespace for RestNamespace {
             check_declared_str = check_declared.to_string();
             query.push(("check_declared", check_declared_str.as_str()));
         }
+        // Always request credential vending so the client can access the table's storage
+        request.vend_credentials = Some(true);
         self.post_json(&path, &query, &request, "describe_table", &id)
             .await
     }
@@ -1568,6 +1742,57 @@ mod tests {
     use bytes::Bytes;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Env values a platform typically injects for a whole temporary credential.
+    fn databuilder_env(key: &str) -> Option<String> {
+        match key {
+            "DATABUILDER_ACCESS_KEY_ID" => Some("env-ak".to_string()),
+            "DATABUILDER_SECRET_ACCESS_KEY" => Some("env-sk".to_string()),
+            "DATABUILDER_SESSION_TOKEN" => Some("env-token".to_string()),
+            _ => None,
+        }
+    }
+
+    #[rstest::rstest]
+    // A property-provided key never picks up the platform's session token.
+    #[case::properties_without_session_token(
+        vec![("access-key-id", "prop-ak"), ("secret-access-key", "prop-sk")],
+        Some(("prop-ak", "prop-sk", None))
+    )]
+    #[case::properties_with_session_token(
+        vec![("access-key-id", "prop-ak"), ("secret-access-key", "prop-sk"), ("session-token", "prop-token")],
+        Some(("prop-ak", "prop-sk", Some("prop-token")))
+    )]
+    // A blank session token must not become an empty x-amz-security-token header.
+    #[case::properties_with_blank_session_token(
+        vec![("access-key-id", "prop-ak"), ("secret-access-key", "prop-sk"), ("session-token", "  ")],
+        Some(("prop-ak", "prop-sk", None))
+    )]
+    #[case::env_only(vec![], Some(("env-ak", "env-sk", Some("env-token"))))]
+    // A partial credential in properties stays partial rather than mixing sources.
+    #[case::incomplete_properties(vec![("access-key-id", "prop-ak")], None)]
+    #[case::session_token_property_only(vec![("session-token", "prop-token")], None)]
+    fn test_resolve_credentials_uses_one_source(
+        #[case] props: Vec<(&str, &str)>,
+        #[case] expected: Option<(&str, &str, Option<&str>)>,
+    ) {
+        let properties: HashMap<String, String> = props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        let credentials = RestNamespaceBuilder::resolve_credentials(&properties, databuilder_env);
+
+        match expected {
+            Some((access_key_id, secret_access_key, session_token)) => {
+                let credentials = credentials.expect("expected credentials");
+                assert_eq!(credentials.access_key_id(), access_key_id);
+                assert_eq!(credentials.secret_access_key(), secret_access_key);
+                assert_eq!(credentials.session_token(), session_token);
+            }
+            None => assert!(credentials.is_none()),
+        }
+    }
 
     #[test]
     fn test_rest_namespace_creation() {
